@@ -6,7 +6,7 @@ import chisel3.util._
 class HitTest extends Module {
   val io = IO(new Bundle {
     val tagData   = Input(Vec(CacheParams.nWays, new TagEntry))
-    val tag       = Input(UInt(21.W))
+    val tag       = Input(UInt(CacheParams.tagBits.W))
     val memRen    = Input(Bool())
     val wen       = Input(Bool())
     val isHit     = Output(Bool())

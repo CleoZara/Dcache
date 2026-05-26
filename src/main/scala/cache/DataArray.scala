@@ -6,7 +6,7 @@ import chisel3.util._
 class DataArray extends Module {
   import CacheParams._
   val io = IO(new Bundle {
-    val idx          = Input(UInt(5.W))
+    val idx          = Input(UInt(idxBits.W))
     val wordsoff     = Input(UInt(4.W))
     val hitWen       = Input(Bool())
     val hitWay       = Input(UInt(2.W))
@@ -14,10 +14,10 @@ class DataArray extends Module {
     val wmask        = Input(UInt(4.W))
     val refillDataEn = Input(Bool())
     val refillWay    = Input(UInt(2.W))
-    val refillIdx    = Input(UInt(5.W))
+    val refillIdx    = Input(UInt(idxBits.W))
     val refillWord   = Input(UInt(4.W))
     val refillData   = Input(UInt(32.W))
-    val evictIdx     = Input(UInt(5.W))
+    val evictIdx     = Input(UInt(idxBits.W))
     val evictWay     = Input(UInt(2.W))
     val evictLine    = Output(Vec(lineWords, UInt(32.W)))
     val rawData      = Output(Vec(nWays, UInt(32.W)))

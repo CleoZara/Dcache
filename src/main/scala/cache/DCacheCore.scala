@@ -8,9 +8,12 @@ import chisel3._
 import chisel3.util._
 
 object CacheParams {
-  val nSets     = 32
+  val nSets     = 128
   val nWays     = 4
   val lineWords = 16
+  val offsetBits = 6
+  val idxBits    = log2Ceil(nSets)
+  val tagBits    = 32 - offsetBits - idxBits
 }
 
 // =============================================================================
@@ -43,25 +46,25 @@ class DCacheCore extends Module {
     val printChar = Output(Valid(UInt(8.W)))
     // A→B 接口
     val missValid  = Output(Bool())
-    val evictIdx   = Output(UInt(5.W))
+    val evictIdx   = Output(UInt(idxBits.W))
     val evictWay   = Output(UInt(2.W))
-    val evictTag   = Output(UInt(21.W))
+    val evictTag   = Output(UInt(tagBits.W))
     val evictDirty = Output(Bool())
     val evictLine  = Output(Vec(lineWords, UInt(32.W)))
     // B→A 接口
     val refillEn      = Input(Bool())
     val refillWay     = Input(UInt(2.W))
-    val refillIdx     = Input(UInt(5.W))
+    val refillIdx     = Input(UInt(idxBits.W))
     val refillWord    = Input(UInt(4.W))
     val refillData    = Input(UInt(32.W))
-    val refillTag     = Input(UInt(21.W))
+    val refillTag     = Input(UInt(tagBits.W))
     val refillDone    = Input(Bool())
     val refillIsStore = Input(Bool())
   })
 
   // ── 地址分解 ────────────────────────────────────────────────────────────────
-  val addrTag  = io.addr(31, 11)
-  val addrIdx  = io.addr(10,  6)
+  val addrTag  = io.addr(31, offsetBits + idxBits)
+  val addrIdx  = io.addr(offsetBits + idxBits - 1, offsetBits)
   val addrWoff = io.addr( 5,  2)
   val addrBoff = io.addr( 1,  0)
 

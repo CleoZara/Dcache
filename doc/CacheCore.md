@@ -26,9 +26,9 @@
 ```plaintext
 addr[31:0] 物理地址划分：
 +-----------------------------------------+---------------+-------------------+
-| 31                                   11 | 10          6 | 5               0 |
+| 31                                   13 | 12          6 | 5               0 |
 |                   Tag                   |     Index     |       offset      |
-|                (21 bits)                |   (5 bits)    |      (6 bits)     |
+|                (19 bits)                |   (7 bits)    |      (6 bits)     |
 +-----------------------------------------+---------------+---------+---------+
                                                           | 5     2 | 1     0 |
                                                           | wordsoff| byteoff |
@@ -57,9 +57,9 @@ addr[31:0] 物理地址划分：
 | 信号名 | 位宽 | 产生来源 | 作用 |
 |--------|------|---------|------|
 | `missValid` | 1 | `HitTest.missValid` | miss 触发脉冲，为 1 时以下所有字段有效；已由 `memRen \| wen` 门控，且旁路地址强制为 0，不会虚触发 |
-| `evictIdx` | 5 | `addr[10:6]` | miss 发生的组索引 |
+| `evictIdx` | 7 | `addr[12:6]` | miss 发生的组索引 |
 | `evictWay` | 2 | `TreePLRU.evictWay` | PLRU 选出的被驱逐路号 |
-| `evictTag` | 21 | `TagArray.tagData(evictWay).tag` | 被驱逐路旧 tag，用于构造写回地址：`{evictTag, evictIdx, wordCnt, 2'b0}` |
+| `evictTag` | 19 | `TagArray.tagData(evictWay).tag` | 被驱逐路旧 tag，用于构造写回地址：`{evictTag, evictIdx, wordCnt, 2'b0}` |
 | `evictDirty` | 1 | `TagArray.tagData(evictWay).dirty` | 被驱逐路是否脏：为 1 时需先写回再回填，为 0 时跳过写回 |
 | `evictLine` | Vec(16, 32) | `DataArray.evictLine` | 被驱逐路的完整 64B 数据；`DataArray` 为组合读，在 `missValid=1` 的当拍即有效，B 应在该拍锁存 |
 
@@ -69,10 +69,10 @@ addr[31:0] 物理地址划分：
 |--------|------|---------|------|
 | `refillEn` | 1 | FSM（sRefillWait 状态）| 为 1 时当拍 `refillData` 有效，A 应将其写入 `DataArray` |
 | `refillWay` | 2 | FSM（锁存自 `evictWay`） | 指定写入 `DataArray` 的路号，与 `evictWay` 始终相同 |
-| `refillIdx` | 5 | FSM（锁存自 `evictIdx`） | 指定写入 `DataArray` 的组号，与 `evictIdx` 始终相同 |
+| `refillIdx` | 7 | FSM（锁存自 `evictIdx`） | 指定写入 `DataArray` 的组号，与 `evictIdx` 始终相同 |
 | `refillWord` | 4 | FSM（字计数器） | 行内字偏移（0–15），指定写入 `DataArray` 的字位置 |
 | `refillData` | 32 | 内存总线 | 本拍从内存返回的 32 位字数据，A 直接写入 `DataArray` |
-| `refillTag` | 21 | FSM（锁存自 miss 地址） | 新写入行的标签值，A 写入 `TagArray`；`valid` 位始终置 1，`dirty` 初值由 `refillIsStore` 决定 |
+| `refillTag` | 19 | FSM（锁存自 miss 地址） | 新写入行的标签值，A 写入 `TagArray`；`valid` 位始终置 1，`dirty` 初值由 `refillIsStore` 决定 |
 | `refillDone` | 1 | FSM（sDone 状态） | 单拍脉冲，为 1 时回填全部完成；A 在本拍更新 `TagArray` 并由 B 解除 stall |
 | `refillIsStore` | 1 | FSM（锁存自 miss 类型） | 原始 miss 是否为 Store；为 1 时 `TagArray` 对应行 dirty 初值为 1 |
 
@@ -89,7 +89,7 @@ Cache Data 结构示意图
                                |
                                v
                       +---------+                                               +---------+
-                      |  set 0  |                                               | set  31 |
+                      |  set 0  |                                               | set 127 |
                       +---------+                                               +---------+
 Tag 索引
    |
@@ -135,7 +135,7 @@ way 3    |                                            |   ......   |            
 | 信号名 | 位宽 | 类型 | 说明 |
 |--------|------|------|------|
 | `tagData` | 4 × TagEntry | input | TagArray 输出的当前组四路 tag 信息 |
-| `tag` | 21 | input | 地址中提取的标签位 |
+| `tag` | 19 | input | 地址中提取的标签位 |
 | `memRen` | 1 | input | 访存读使能，来自 CPU 接口，用于门控 miss 信号 |
 | `wen` | 1 | input | 写使能，来自 CPU 接口，用于门控 miss 信号 |
 | `isHit` | 1 | output | 命中时置高 |
@@ -157,11 +157,11 @@ way 3    |                                            |   ......   |            
 | 信号名 | 位宽 | 类型 | 说明 |
 |--------|------|------|------|
 | `flush` | 1 | input | 复位清理 Cache 信号 |
-| `idx` | 5 | input | 地址中提取的 Index 位，用于组合读 |
+| `idx` | 7 | input | 地址中提取的 Index 位，用于组合读 |
 | `refillTagEn` | 1 | input | 为 1 时本拍执行回填写入，优先级高于 `setDirtyEn` |
 | `refillWay` | 2 | input | 回填写入的路索引 |
-| `refillIdx` | 5 | input | 回填写入的组索引 |
-| `refillTag` | 21 | input | 回填行的标签值（21 位，不含 valid/dirty）；TagArray 内部将 valid 置 1，dirty 由 `refillDirty` 决定 |
+| `refillIdx` | 7 | input | 回填写入的组索引 |
+| `refillTag` | 19 | input | 回填行的标签值（19 位，不含 valid/dirty）；TagArray 内部将 valid 置 1，dirty 由 `refillDirty` 决定 |
 | `refillDirty` | 1 | input | 回填行 dirty 初值，等于 B 侧传入的 `refillIsStore`；Store miss 时置 1 |
 | `setDirtyEn` | 1 | input | 置高 dirty 位使能，逻辑上为 `isHit & wen`；当 `refillTagEn=1` 时本信号被屏蔽 |
 | `setDirtyWay` | 2 | input | 置高 dirty 位的路索引，逻辑上为 `hitWay` |
@@ -175,11 +175,11 @@ TagArray 内部定义了一个 `TagEntry` 类：
 class TagEntry extends Bundle {
   val valid = Bool()
   val dirty = Bool()
-  val tag   = UInt(21.W)
+  val tag   = UInt(CacheParams.tagBits.W)
 }
 ```
 
-TagArray 内部定义了一个 32 × 4 × TagEntry 大小的标签阵列：
+TagArray 内部定义了一个 128 × 4 × TagEntry 大小的标签阵列：
 
 ```scala
 val tArray = RegInit(VecInit(Seq.fill(nSets)(
@@ -201,7 +201,7 @@ val tArray = RegInit(VecInit(Seq.fill(nSets)(
 
 | 信号名 | 位宽 | 类型 | 说明 |
 |--------|------|------|------|
-| `idx` | 5 | input | 地址中提取的 Index 位 |
+| `idx` | 7 | input | 地址中提取的 Index 位 |
 | `wordsoff` | 4 | input | 地址中提取的字偏移位 |
 | `hitWen` | 1 | input | 命中写使能，逻辑上为 `isHit & wen`；为 1 时执行 Hit Store 写入 |
 | `hitWay` | 2 | input | 命中写的路索引，逻辑上为 `HitTest.hitWay` |
@@ -209,17 +209,17 @@ val tArray = RegInit(VecInit(Seq.fill(nSets)(
 | `wmask` | 4 | input | 写操作字节使能（掩码） |
 | `refillDataEn` | 1 | input | 为 1 时当拍 `refillData` 有效，执行回填逐字写入 |
 | `refillWay` | 2 | input | 回填写入的路索引 |
-| `refillIdx` | 5 | input | 回填写入的组索引 |
+| `refillIdx` | 7 | input | 回填写入的组索引 |
 | `refillWord` | 4 | input | 回填行内字偏移（0–15） |
 | `refillData` | 32 | input | 本拍从内存返回的 32 位字数据 |
-| `evictIdx` | 5 | input | 待写回内存 CacheLine 的组索引 |
+| `evictIdx` | 7 | input | 待写回内存 CacheLine 的组索引 |
 | `evictWay` | 2 | input | 待写回内存 CacheLine 的路索引 |
 | `evictLine` | Vec(16, 32) | output | 待写回内存的完整 64B 数据（组合输出，`missValid=1` 当拍即有效） |
 | `rawData` | 4 × 32 | output | 当前 `idx` 和 `wordsoff` 对应的四路单字数据（组合输出） |
 
 #### **内部结构**
 
-DataArray 内部定义了一个 4 × 32 × 16 × 32 的数据阵列：
+DataArray 内部定义了一个 4 × 128 × 16 × 32 的数据阵列：
 
 ```scala
 val dArray = Reg(Vec(nWays, Vec(nSets, Vec(lineWords, UInt(32.W)))))
@@ -242,14 +242,14 @@ val dArray = Reg(Vec(nWays, Vec(nSets, Vec(lineWords, UInt(32.W)))))
 
 | 信号名 | 位宽 | 类型 | 说明 |
 |--------|------|------|------|
-| `idx` | 5 | input | 地址中提取的 Index 位 |
+| `idx` | 7 | input | 地址中提取的 Index 位 |
 | `updateEn` | 1 | input | 更新二叉树使能；由 DCacheCore 按如下逻辑驱动：命中时为 `isHit & (memRen \| wen)`，回填完成时为 `refillDone`；旁路访问时强制为 0 |
 | `updateWay` | 2 | input | 本次更新对应的路：命中时为 `hitWay`，回填完成时为 `refillWay` |
 | `evictWay` | 2 | output | 最久未被访问路的索引（组合输出） |
 
 #### **内部结构**
 
-PLRU 内部定义一个 32 × 3 的二叉树阵列：
+PLRU 内部定义一个 128 × 3 的二叉树阵列：
 
 ```scala
 val treeArray = RegInit(VecInit(Seq.fill(nSets)(0.U(3.W))))

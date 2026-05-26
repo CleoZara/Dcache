@@ -52,11 +52,14 @@ class DCacheCoreSpec extends AnyFlatSpec with ChiselScalatestTester {
   // 测试辅助工具
   // ─────────────────────────────────────────────────────────────────────────
 
-  /** 构造 32-bit 物理地址
-   *  addr[31:11]=tag(21b), [10:6]=idx(5b), [5:2]=wordsoff(4b), [1:0]=byteoff(2b)
+  /** Build a 32-bit physical address.
+   *  addr[31:13]=tag(19b), [12:6]=idx(7b), [5:2]=wordsoff(4b), [1:0]=byteoff(2b)
    */
-  def makeAddr(tag: Int, idx: Int, wordsoff: Int, byteoff: Int): BigInt =
-    (BigInt(tag) << 11) | (BigInt(idx) << 6) | (BigInt(wordsoff) << 2) | BigInt(byteoff)
+  def makeAddr(tag: Int, idx: Int, wordsoff: Int, byteoff: Int): BigInt = {
+    val tagShift = CacheParams.offsetBits + CacheParams.idxBits
+    val idxShift = CacheParams.offsetBits
+    (BigInt(tag) << tagShift) | (BigInt(idx) << idxShift) | (BigInt(wordsoff) << 2) | BigInt(byteoff)
+  }
 
   /** 所有 CPU 输入 + B 侧输入置为 idle */
   def setIdle(dut: DCacheCore): Unit = {

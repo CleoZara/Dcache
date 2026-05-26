@@ -6,7 +6,7 @@ import chisel3.util._
 class TreePLRU extends Module {
   import CacheParams._
   val io = IO(new Bundle {
-    val idx       = Input(UInt(5.W))
+    val idx       = Input(UInt(idxBits.W))
     val updateEn  = Input(Bool())
     val updateWay = Input(UInt(2.W))
     val evictWay  = Output(UInt(2.W))

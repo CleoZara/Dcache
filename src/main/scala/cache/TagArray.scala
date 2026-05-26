@@ -6,19 +6,19 @@ import chisel3.util._
 class TagEntry extends Bundle {
   val valid = Bool()
   val dirty = Bool()
-  val tag   = UInt(21.W)
+  val tag   = UInt(CacheParams.tagBits.W)
 }
 
 class TagArray extends Module {
   import CacheParams._
   val io = IO(new Bundle {
     val flush       = Input(Bool())
-    val idx         = Input(UInt(5.W))
+    val idx         = Input(UInt(idxBits.W))
     val tagData     = Output(Vec(nWays, new TagEntry))
     val refillTagEn = Input(Bool())
     val refillWay   = Input(UInt(2.W))
-    val refillIdx   = Input(UInt(5.W))
-    val refillTag   = Input(UInt(21.W))
+    val refillIdx   = Input(UInt(idxBits.W))
+    val refillTag   = Input(UInt(tagBits.W))
     val refillDirty = Input(Bool())
     val setDirtyEn  = Input(Bool())
     val setDirtyWay = Input(UInt(2.W))
