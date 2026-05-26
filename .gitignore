@@ -1,0 +1,17 @@
+target/
+test_run_dir/
+
+*.class
+*.log
+*.vcd
+*.fst
+*.lxt
+*.ghw
+*.wlf
+*.vpd
+
+.bsp/
+.bloop/
+.metals/
+.idea/
+.vscode/
