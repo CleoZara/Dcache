@@ -27,7 +27,9 @@ class DataArray extends Module {
     io.rawData(w) := dArray(w)(io.idx)(io.wordsoff)
   }
   io.evictLine := dArray(io.evictWay)(io.evictIdx)
-  when(io.hitWen) {
+  when(io.refillDataEn) {
+    dArray(io.refillWay)(io.refillIdx)(io.refillWord) := io.refillData
+  }.elsewhen(io.hitWen) {
     val old      = dArray(io.hitWay)(io.idx)(io.wordsoff)
     val byteMask = Cat(
       Fill(8, io.wmask(3)), Fill(8, io.wmask(2)),
@@ -35,8 +37,5 @@ class DataArray extends Module {
     )
     dArray(io.hitWay)(io.idx)(io.wordsoff) :=
       (io.wdata & byteMask) | (old & ~byteMask)
-  }
-  when(io.refillDataEn) {
-    dArray(io.refillWay)(io.refillIdx)(io.refillWord) := io.refillData
   }
 }

@@ -50,7 +50,46 @@ addr[31:0] 物理地址划分：
 
 ---
 
-### 成员交接端口说明
+### 外部内存总线接口（MemBusIO）
+
+`DCacheTop` 将 `DCacheMissFSM` 的内存总线直接透传到顶层（`io.mem <> missFsm.io.mem`），所有片外访问（写回脏行、回填新行）均经由此接口。协议采用 Chisel `Decoupled` 标准（Ready-Valid），握手条件为 `valid && ready` 同时为高的时钟上升沿。
+
+#### **请求通道（req，DCacheTop → MEM）**
+
+| 信号名 | 位宽 | 类型 | 说明 |
+|--------|------|------|------|
+| `mem.req.valid` | 1 | output | FSM 发出请求时置高；握手成立前不得撤回 |
+| `mem.req.ready` | 1 | input | 内存接受请求，握手成立 |
+| `mem.req.bits.addr` | 32 | output | 访问地址（写回时为旧行地址，回填时为新行地址） |
+| `mem.req.bits.wdata` | 32 | output | 写数据（读请求时忽略） |
+| `mem.req.bits.wen` | 1 | output | 写使能；`1` = 写回脏行，`0` = 回填读取 |
+| `mem.req.bits.wmask` | 4 | output | 字节写掩码；写回时固定 `4'b1111`，回填读请求时为 `0` |
+
+#### **响应通道（resp，MEM → DCacheTop）**
+
+| 信号名 | 位宽 | 类型 | 说明 |
+|--------|------|------|------|
+| `mem.resp.valid` | 1 | input | 内存返回数据有效 |
+| `mem.resp.ready` | 1 | output | FSM 在 `sWbResp` 或 `sRefillResp` 状态时置高，其余状态为 `0` |
+| `mem.resp.bits.rdata` | 32 | input | 读返回数据（写请求响应时忽略） |
+
+#### **时序约束**
+
+内存总线延迟固定为 **10 个时钟周期**（自 `req` 握手起至 `resp.valid` 有效止）。FSM 每次传输一个字（32 bit），写回和回填各需 16 次握手，共 32 次总线事务。
+
+```
+sWbReq:    req.valid=1, wen=1, addr={evictTag,idx,wordCnt,0}
+              ↓ req.fire（ready=1）
+sWbResp:   等待 resp.fire，wordCnt+1；wordCnt==15 → sRefillReq
+              ↓ ×16
+sRefillReq: req.valid=1, wen=0, addr={missTag,idx,wordCnt,0}
+              ↓ req.fire
+sRefillResp: 等待 resp.fire，refillEn=1，写 DataArray；wordCnt==15 → sDone
+              ↓ ×16
+sDone:      refillDone=1，TagArray 更新，stall 解除
+```
+
+
 
 #### **cachecore → miss fsm 信号 成员 A 到 B**
 
@@ -67,7 +106,7 @@ addr[31:0] 物理地址划分：
 
 | 信号名 | 位宽 | 产生来源 | 作用 |
 |--------|------|---------|------|
-| `refillEn` | 1 | FSM（sRefillWait 状态）| 为 1 时当拍 `refillData` 有效，A 应将其写入 `DataArray` |
+| `refillEn` | 1 | FSM（`sRefillResp` 状态，`resp.fire` 同拍）| 为 1 时当拍 `refillData` 有效，A 应将其写入 `DataArray` |
 | `refillWay` | 2 | FSM（锁存自 `evictWay`） | 指定写入 `DataArray` 的路号，与 `evictWay` 始终相同 |
 | `refillIdx` | 7 | FSM（锁存自 `evictIdx`） | 指定写入 `DataArray` 的组号，与 `evictIdx` 始终相同 |
 | `refillWord` | 4 | FSM（字计数器） | 行内字偏移（0–15），指定写入 `DataArray` 的字位置 |
@@ -121,8 +160,8 @@ way 3    |                                            |   ......   |            
 
 - **命中读**：`TagArray`、`DataArray` 模块取出对应 `idx`、`wordsoff` 的四路所有 tag 和 data，`HitTest` 模块比较地址和 tag 阵列存储的 tag 值获得命中的路索引，接着更新 `PLRU`，同时在 `LoadExtend` 模块根据 `byteoff`、`memWd` 以及 `signed` 信号处理读出的数据，送入 `rdata`。
 - **命中写**：`TagArray` 模块取出对应 `idx` 的四路所有 tag，`HitTest` 模块比较地址和 tag 阵列存储的 tag 值获得命中的路索引，接着更新 PLRU，最后在 `DataArray` 中根据 `wmask` 将 `wdata` 写入，并同步更新 `dirty` 信息。
-- **未命中回填**：`HitTest` 检测发现未命中，流水线停顿，根据 `PLRU` 选中的 `evictWay` 在 `DataArray` 中将对应 CacheLine 数据从内存中逐字搬运进对应路，最后更新 tag 信息。
-- **未命中写回**：`HitTest` 检测发现未命中，检测 `dirty` 位，若为高需要将数据搬运至 `evictLine` 最终写回内存。
+- **未命中回填**：`HitTest` 检测发现未命中，流水线停顿，MissHandler FSM 经 `sIdle→sCheck→sRefillReq→sRefillResp（×16）→sDone` 流程，根据 `PLRU` 选中的 `evictWay` 在 `DataArray` 中将对应 CacheLine 数据从内存中逐字搬运进对应路，`sDone` 拍更新 TagArray 并解除 stall。
+- **未命中写回**：`HitTest` 检测发现未命中，`sCheck` 拍检测 `dirty` 位，若为高则先经 `sWbReq→sWbResp（×16）` 将脏行数据逐字写回内存，再进入回填流程。
 
 ---
 
@@ -231,7 +270,7 @@ val dArray = Reg(Vec(nWays, Vec(nSets, Vec(lineWords, UInt(32.W)))))
 
 - **读逻辑**：根据 `idx` 和 `wordsoff`，组合输出四路各自该字位置的数据，作为 `rawData[0..3]` 送入 `LoadExtend`；根据 `evictIdx` 和 `evictWay` 组合输出整行 16 字数据作为 `evictLine`，在 `missValid=1` 当拍即有效，B 侧应在该拍锁存。
 - **Hit 写逻辑（hitWen=1）**：按 `wmask` 字节掩码将 `wdata` 写入 `dArray(hitWay)(idx)(wordsoff)` 中对应字节，未被掩码覆盖的字节保持不变。
-- **Miss 回填写逻辑（refillDataEn=1）**：将 `refillData` 写入 `dArray(refillWay)(refillIdx)(refillWord)`，每拍写一个字，由 B 侧 FSM 驱动 `refillWord` 从 0 计数至 15。
+- **Miss 回填写逻辑（refillDataEn=1，优先级高于 hitWen）**：将 `refillData` 写入 `dArray(refillWay)(refillIdx)(refillWord)`，每拍写一个字，由 B 侧 FSM 驱动 `refillWord` 从 0 计数至 15。实现时应使用 `when(refillDataEn)...elsewhen(hitWen)...` 保证显式优先级（miss 期间流水线 stall，hitWen 理论上不会为高，但防御性编程仍须显式）。
 - **Miss 写回读逻辑**：`evictLine` 始终组合输出 `dArray(evictWay)(evictIdx)` 的全部 16 个字，供 B 侧 FSM 在写回阶段逐字取用。
 
 ---
@@ -288,7 +327,38 @@ val treeArray = RegInit(VecInit(Seq.fill(nSets)(0.U(3.W))))
 
 ---
 
-## 4. PMA 旁路逻辑
+## 4. MissHandler FSM
+
+### 状态说明
+
+FSM 共 7 个状态，处理一次 miss 的完整写回 + 回填流程：
+
+| 状态 | 行为 |
+|------|------|
+| `sIdle` | 等待 `missValid=1`；触发时锁存 `missTag / evictTag / evictIdx / evictWay / evictDirty / missIsStore / evictLine`，并重置 `wordCnt=0` |
+| `sCheck` | 单拍判断：`dirtyLatch=1` → 跳 `sWbReq`；否则直接跳 `sRefillReq` |
+| `sWbReq` | 向总线发出脏行写请求（`req.valid=1, wen=1`）；等待 `req.fire`（ready=1）后进 `sWbResp` |
+| `sWbResp` | 等待 `resp.fire`；每次 `resp.fire` 后 `wordCnt+1`；`wordCnt==15` 时跳 `sRefillReq`，否则回 `sWbReq` |
+| `sRefillReq` | 向总线发出回填读请求（`req.valid=1, wen=0`）；等待 `req.fire` 后进 `sRefillResp` |
+| `sRefillResp` | 等待 `resp.fire`；同拍拉高 `refillEn`，将 `resp.rdata` 逐字写入 DataArray；`wordCnt==15` 时跳 `sDone`，否则回 `sRefillReq` |
+| `sDone` | 单拍：`refillDone=1`，A 侧在本拍更新 TagArray；FSM 下一拍自动跳回 `sIdle`，stall 解除 |
+
+### 地址构造
+
+```
+写回地址（sWbReq）：{evictTagLatch, idxLatch, wordCnt, 2'b00}  ← 旧行地址
+回填地址（sRefillReq）：{missTagLatch,  idxLatch, wordCnt, 2'b00}  ← 新行地址
+```
+
+两套地址使用独立的 latch，`Mux(isWbReq, wbAddr, refillAddr)` 选择，避免 clean miss 时用错旧 tag 回填。
+
+### stall 信号
+
+`stall = (state =/= sIdle)`，在 `sDone` 拍仍为 1（TagArray 正在写入），`sDone` 之后的下一拍 state 回到 `sIdle`，stall 变 0，流水线解冻。
+
+---
+
+## 5. PMA 旁路逻辑
 
 本设计在 MEM 级对两类特殊物理地址进行 PMA 检查，命中时访问直接在 DCacheCore 顶层截获，不进入 Cache 流程，不触发 MissHandler FSM，不产生 stall。
 
@@ -348,224 +418,218 @@ val isBypass      = addrIsPrintf || addrIsMtimeLo || addrIsMtimeHi
 
 ---
 
-## 5. 仿真验证说明
+## 6. 仿真验证说明
 
-以下 21 个测试用例覆盖 DCacheCore 的全部功能路径，采用 Verilator 后端加速仿真。
+以下 21 个测试用例覆盖 DCacheTop 的全部功能路径，采用 Verilator 后端加速仿真（每个测试添加 `VerilatorBackendAnnotation`）。内存模型（`DRAMSim`）固定延迟 10 个周期，always-ready。
 
----
-
-### T01 — Flush 清零逻辑
-
-**行为**：先回填两条 CacheLine（set=0 way=0，set=1 way=0），验证回填后均可命中；随后拉高 `flush` 一拍，再次访问同地址。
-
-**验证目标**：`flush` 触发后，`TagArray` 中所有组所有路的 `valid` 和 `dirty` 位清零，后续访问必然 miss；同时验证 idle 状态（`memRen=0` 且 `wen=0`）下 `missOut` 和 `missValid` 均为 0，不产生虚触发。
-
-**期望结果**：flush 前两次 Load 均命中；flush 后同地址 Load 均 miss，`missOut=1`，`missValid=1`；idle 时两者为 0。
+**地址构造**：`mkAddr(tag, idx, word=0, byte=0)` = `{tag[31:13], idx[12:6], word[5:2], byte[1:0]}`，即 `(tag << 13) | (idx << 6) | (word << 2) | byte`。
 
 ---
 
-### T02 — HIT 读数据处理
+### T01 — 冷 Load Miss 返回正确数据
 
-**行为**：回填一条包含 `0xDEADBEEF` 的 CacheLine，随后对同一地址分别执行字访问、半字访问（`byteoff=0` 和 `byteoff=2`）、字节访问（全部 4 个 `byteoff`），每种宽度分别测试有符号和无符号扩展。
+**场景**：对空 Cache 发出 Load，DRAM 中预设目标字为 `0xCAFEBABE`。
 
-**验证目标**：`LoadExtend` 模块的路选择、字节/半字提取、符号扩展逻辑全部正确；字访问直通不受 `byteoff` 影响。
+**验证目标**：冷 miss 触发完整 FSM 流程，`stall` 全程为 1，回填完成后 `rdata` 返回 DRAM 预设值，耗时多于 1 拍。
 
-**期望结果**：字返回 `0xDEADBEEF`；无符号半字 `boff=0` 返回 `0x0000BEEF`，`boff=2` 返回 `0x0000DEAD`；有符号半字对应 `0xFFFFBEEF` / `0xFFFFDEAD`；4 个字节偏移的无符号/有符号值均与手工计算一致。
-
----
-
-### T03 — HIT 写字节掩码
-
-**行为**：回填初始值 `0x12345678`，依次用 `wmask=0001`、`wmask=0010`、`wmask=1100`、`wmask=1111` 执行 Store，每次写后立即 Load 读回。
-
-**验证目标**：`DataArray` 的字节掩码写逻辑精确，被掩码覆盖的字节更新，未覆盖的字节保持原值不变。
-
-**期望结果**：每次 Store 后 Load 值与按位计算的预期完全一致（`0x12345699` → `0x1234BB99` → `0xAACCBB99` → `0xDEADFACE`）。
+**关键断言**：`rdata == 0xCAFEBABE`；`elapsed > 1`。
 
 ---
 
-### T04 — HIT 写 dirty 位与 flush 清零
+### T02 — 命中：第二次访问同一行在第一拍命中
 
-**行为**：回填 CacheLine 后执行 Store hit，使 way=0 变脏；之后访问同 idx 不同 tag 地址触发 miss，观察 `evictDirty`；再执行 flush，重新回填后再次触发 miss。
+**场景**：先触发 miss 完成回填；之后以相同地址再次 Load。
 
-**验证目标**：Store hit 后 `TagArray` 中对应路的 `dirty` 位被置 1；flush 后 dirty 位清零，驱逐时 `evictDirty=0`。
+**验证目标**：回填后 TagArray valid 已置位，第二次访问在第 1 拍即 `stall=0`，无需进入 FSM。
 
-**期望结果**：第一次驱逐时若 `evictWay=0`，`evictDirty=1`；flush 并重新回填后驱逐同路，`evictDirty=0`。
-
----
-
-### T05 — MISS 回填时序边界
-
-**行为**：对空 Cache 发出 Load 触发 miss；随后模拟 B 侧 FSM 逐字回填 16 拍，在每拍回填的同时检查同地址是否仍 miss；最后发出 `refillDone` 脉冲。
-
-**验证目标**：`TagArray` 的写入仅在 `refillDone` 那一拍 posedge 生效；逐字 `refillEn` 期间 `valid` 位未更新，访问仍产生 miss；`refillDone` 后的下一拍立即命中。
-
-**期望结果**：回填 16 拍中每拍 `missOut=1`；`refillDone` 后首次 Load 命中且返回数据正确。
+**关键断言**：第二次访问第一拍 `stall=0`；`rdata == 0x12345678`。
 
 ---
 
-### T06 — MISS 回填数据完整性
+### T03 — Store Miss 触发 write-allocate；reload 返回写入值
 
-**行为**：回填一条 16 字各不相同的 CacheLine，回填完成后对 `wordsoff=0` 到 `wordsoff=15` 逐字执行 Load。
+**场景**：对空 Cache 地址发出全字 Store（miss）；回填完成后同拍 hit-store 提交；紧接 Load 同地址。
 
-**验证目标**：`DataArray` 的 16 次逐字写入全部正确落位，无覆盖、无偏移。
+**验证目标**：write-allocate 流程正确；`stall=0` 那拍 `hitWen` 生效，DataArray 在 clock edge 更新；reload 无需额外 stall 即命中并返回 Store 写入的值。
 
-**期望结果**：16 次 Load 每次返回值均与写入时对应字的预设值完全吻合。
-
----
-
-### T07 — Store miss 回填 dirty 初值
-
-**行为**：对空 Cache 地址执行 Store（miss），模拟 B 侧以 `refillIsStore=true` 完成回填；之后填满其余三路，再次触发 miss 观察驱逐行的 `evictDirty`。
-
-**验证目标**：Store miss 回填时 `TagArray` 写入的 `dirty` 初值由 `refillIsStore` 决定，为 1；回填后该行在被驱逐时 `evictDirty=1`，通知 B 侧需先写回。
-
-**期望结果**：若驱逐路为 Store miss 回填的路，`evictDirty=1`，`evictTag` 等于 miss 时的 tag 值。
+**关键断言**：reload `stall=0`；`rdata == 0x12345678`。
 
 ---
 
-### T08 — 脏行驱逐信号时序
+### T04 — 命中 Store 字节掩码合并
 
-**行为**：回填 way=0 后执行两次 Store hit（修改 `wordsoff=0` 和 `wordsoff=3`），使 way=0 变脏；之后访问同 idx 不同 tag 地址触发 miss，在 miss 当拍采样 `evictDirty`、`evictTag`、`evictLine`。
+**场景**：Load miss 填充初始值 `0x11223344`；命中 Store `wmask=0x3`（低 2 字节）写入 `0xAABBCCDD`；再次 Load。
 
-**验证目标**：`evictLine` 是 `DataArray` 的组合输出，必须在 `missOut=1` 的当拍即有效，B 侧无需等待额外时钟沿即可读取并开始写回；`evictDirty` 和 `evictTag` 同样当拍有效。
+**验证目标**：`DataArray` 字节掩码逻辑正确，低 2 字节（`byte[1:0]`）被覆盖，高 2 字节保留原值。
 
-**期望结果**：若 `evictWay=0`，`evictDirty=1`，`evictTag` 正确，`evictLine(0)=0x12345678`，`evictLine(3)=0xDEADFACE`，均在 miss 当拍可见。
-
----
-
-### T09 — PLRU 驱逐路序列
-
-**行为**：从全空 Cache（tree=000）开始，依次向 way=0、way=2、way=1、way=3 回填（每次回填触发 `refillDone` 更新 PLRU），每次回填后采样 `evictWay`。
-
-**验证目标**：4 路 Tree-PLRU 的二叉树状态转移严格遵循设计规范，回填顺序 w0→w2→w1→w3 后 `evictWay` 依次为 0→2→1→3→0，循环正确。
-
-**期望结果**：
-
-| 操作 | 预期 tree 状态 | 预期 evictWay |
-|------|-------------|-------------|
-| 初始 | `000` | 0 |
-| refill w0 | `110` | 2 |
-| refill w2 | `011` | 1 |
-| refill w1 | `101` | 3 |
-| refill w3 | `000` | 0（循环） |
+**关键断言**：reload `rdata == 0x1122CCDD`。
 
 ---
 
-### T10 — PLRU idle 期间不更新
+### T05 — 脏行驱逐：写回正确数据后回填新行
 
-**行为**：回填 way=0 后记录当前 `evictWay`；随后保持 `memRen=0`、`wen=0`（idle）推进 3 个时钟周期；再次采样 `evictWay`。
+**场景**：向 set=50 依次填充 tagA/B/C/D 四路，对 tagA word=0 执行 Store（写 `0xDEADBEEF`，way0 变脏）；再 Load tagE 触发驱逐 way0。
 
-**验证目标**：`DCacheCore` 在 idle 拍不拉高 `updateEn`，PLRU 树状态保持不变，避免空泡修改 LRU 历史。
+**验证目标**：FSM 在 `sWbReq/sWbResp` 阶段对 way0 word=0 发出写请求，地址为 `{tagA, idx, 0, 0}`，数据为 `0xDEADBEEF`；写回完成后回填 tagE 成功。
 
-**期望结果**：idle 3 拍前后 `evictWay` 值完全相同。
-
----
-
-### T11 — PLRU 仅在 refillDone 更新
-
-**行为**：从全空 Cache 触发 miss；模拟 B 侧逐字回填 16 拍，在每一拍 `refillEn=1` 期间采样 `evictWay`；最后发出 `refillDone` 脉冲，再次采样。
-
-**验证目标**：`refillEn` 的每一拍均不应更新 PLRU；PLRU 只在 `refillDone` 那一拍的 posedge 更新一次。
-
-**期望结果**：回填 16 拍中 `evictWay` 保持初始值不变；`refillDone` 后 `evictWay` 变为 2（way=0 被标记为最近访问后，下一驱逐目标为 way=2）。
+**关键断言**：监测 `mem.req.wen=1` 且地址匹配时 `wdata == 0xDEADBEEF`；Load tagE 命中且 `rdata == (tE<<8)|0`。
 
 ---
 
-### T12 — missValid 空泡门控
+### T06 — Flush 清零 valid；后续访问变 miss
 
-**行为**：将地址指向必然 miss 的空 Cache 位置，但不置 `memRen` 也不置 `wen`（模拟流水线空泡）；采样 `missOut` 和 `missValid`；再置 `memRen=1` 采样。
+**场景**：Load miss 填充一条 CacheLine，验证命中；拉高 `flush` 1 拍；再次 Load 同地址。
 
-**验证目标**：`HitTest` 的 `missValid = ~isHit & (memRen | wen)` 门控逻辑正确，流水线空泡不产生虚 miss，不误触发 MissHandler FSM。
+**验证目标**：`flush` 信号使 TagArray 中所有 valid/dirty 位清零，之后访问必然 miss；回填后数据仍正确。
 
-**期望结果**：`memRen=0` 且 `wen=0` 时两者均为 0；`memRen=1` 时两者均为 1。
-
----
-
-### T13 — 多 set 独立性
-
-**行为**：向 set=0、1、2、3 各回填一条 tag 相同但数据不同的 CacheLine，随后交叉读取 4 个 set 的 `wordsoff=8` 位置。
-
-**验证目标**：不同 set（idx）的 `TagArray` 和 `DataArray` 行互相独立，不存在索引混淆或数据污染。
-
-**期望结果**：每个 set 读回的字均与写入时的预设值完全一致，4 组数据互不干扰。
+**关键断言**：flush 前命中；flush 后首拍 `stall=1`；重新回填后 `rdata == 0xBEEFCAFE`。
 
 ---
 
-### T14 — 同 idx 多 way 路选择
+### T07 — printf Bypass：SB 触发 printChar；SW 不触发；均不 stall
 
-**行为**：向同一 idx 的 way=0、1、2、3 各回填不同 tag 和数据，然后分别以对应 tag 访问，观察 `rdata`。
+**场景**：向 `0x10001FF1` 分别发出 SB（`memWd=2`，写 `0x41`='A'）和 SW（`memWd=0`）。
 
-**验证目标**：`HitTest` 的命中路判断和 `LoadExtend` 的路选择逻辑正确，4 路中仅命中 tag 匹配的路，`rdata` 来自正确的路数据，不发生路混淆。
+**验证目标**：SB 满足旁路条件，`printChar.valid=1`，`bits=0x41`，`stall=0`；SW 不满足（`memWd≠2`），`printChar.valid=0`。
 
-**期望结果**：每次 Load 均命中且返回对应路预设数据，无跨路串扰。
-
----
-
-### T15 — evictLine 当拍有效性
-
-**行为**：回填 way=0 的完整 16 字 CacheLine；之后访问同 idx 不同 tag 地址触发 miss，在 miss 当拍逐字读取 `evictLine(0..15)`。
-
-**验证目标**：`DataArray` 的 `evictLine` 是纯组合输出（寄存器直接索引），无需等待时钟沿，在 `missOut=1` 的当拍即全部有效，B 侧可立即锁存整行数据。
-
-**期望结果**：若 `evictWay=0`，`evictLine` 16 个字均与回填时写入的值一致；若驱逐了空路，16 字均为 0。
+**关键断言**：SB 时 `printChar.valid=1`，`bits=0x41`，`stall=0`；SW 时 `printChar.valid=0`。
 
 ---
 
-### T16 — printf 旁路 Store Byte
+### T08 — mtime MMIO Bypass：0xBFF8/0xBFFC 立即返回，不 stall
 
-**行为**：先回填一条普通 CacheLine 备用；然后分别向 `0x10001FF1` 发出 SB（写 `'H'=0x48`）和 SB（写 `'!'=0x21`），每次在写操作当拍采样 `printChar.valid`、`printChar.bits`、`missOut`；最后读回普通 CacheLine 验证未被污染。
+**场景**：设置 `mtimeLo=0xDEAD0000`，`mtimeHi=0x0000BEEF`；分别 LW `0xBFF8` 和 `0xBFFC`。
 
-**验证目标**：SB 到 printf 地址时 `printChar` 输出正确字符；访问为单拍完成，`missOut=0` 不产生 stall；整个旁路过程不修改 Cache 任何状态。
+**验证目标**：mtime 地址被旁路截获，当拍返回外部输入值，不触发 FSM，`stall=0`。
 
-**期望结果**：两次 SB 分别触发 `printChar.valid=1`，`bits=0x48` 和 `bits=0x21`；`missOut=0`；普通 CacheLine 读回值不变。
-
----
-
-### T17 — printf 地址非 SB 不触发旁路
-
-**行为**：向 `0x10001FF1` 发出 SW（`memWd=0`，字写），采样 `printChar.valid` 和 `missOut`。
-
-**验证目标**：printf 旁路条件严格限定为 SB（`wen=1` 且 `memWd=2`），非 SB 的写操作不应旁路，应走正常 Cache miss 流程；`printChar` 不应有任何输出。
-
-**期望结果**：`printChar.valid=0`；`missOut=1`（Cache 中无对应 tag，正常 miss）。
+**关键断言**：`0xBFF8` 读 `rdata == 0xDEAD0000`；`0xBFFC` 读 `rdata == 0x0000BEEF`；均 `stall=0`。
 
 ---
 
-### T18 — printf 地址误 Load
+### T09 — 字节 Load 符号/零扩展（LB/LBU）
 
-**行为**：向 `0x10001FF1` 发出 LB（`memRen=1`，`memWd=2`），采样 `printChar.valid`、`rdata`、`missOut`。
+**场景**：DRAM 预设 word=`0xABCDEF80`，LB byte=0（有符号）和 LBU byte=0（无符号）。
 
-**验证目标**：Load 到 printf 地址属于旁路路径，不 stall，不产生 miss，`rdata` 返回 0（行为未定义，硬件统一返回 0）；`printChar` 只在 Store 时有效，Load 时不触发。
+**验证目标**：`LoadExtend` 符号扩展逻辑正确，`0x80` 的最高位为 1，LB 结果为 `0xFFFFFF80`，LBU 为 `0x00000080`。
 
-**期望结果**：`printChar.valid=0`；`rdata=0`；`missOut=0`。
-
----
-
-### T19 — mtime Load 旁路
-
-**行为**：设置 `mtimeLo=0xCAFEBABE`，向 `0xBFF8` 发出 LW，采样 `rdata` 和 `missOut`；设置 `mtimeHi=0xDEADD00D`，向 `0xBFFC` 发出 LW，采样；最后改变 `mtimeLo` 的值再次读 `0xBFF8`，验证组合输出跟随性。
-
-**验证目标**：mtime 地址的 Load 被旁路截获，`rdata` 直接来自外部输入 `mtimeLo`/`mtimeHi`，是当拍组合输出，随输入变化立即变化；访问不 stall，不触发 FSM，不污染 Cache。
-
-**期望结果**：`rdata` 与对应输入信号完全一致；`missOut=0`；`printChar.valid=0`。
+**关键断言**：LB `rdata == 0xFFFFFF80`；LBU `rdata == 0x00000080`。
 
 ---
 
-### T20 — mtime Store 静默忽略
+### T10 — 半字 Load 符号/零扩展（LH/LHU）
 
-**行为**：分别向 `0xBFF8` 和 `0xBFFC` 发出 SW，采样 `missOut` 和 `missValid`；之后再次 Load `0xBFF8`，验证 `mtimeLo` 仍由外部输入决定；读回普通 CacheLine 验证未受干扰。
+**场景**：DRAM 预设 word=`0x80001234`，LH byte=2（高半字，有符号）和 LHU byte=2（无符号）。
 
-**验证目标**：Store 到 mtime 地址被旁路截获，硬件静默忽略写操作，不产生 stall，不修改任何寄存器，不影响 Cache 状态；计数器值完全由外部 `mtimeLo`/`mtimeHi` 输入决定。
+**验证目标**：`LoadExtend` 半字提取逻辑正确，高半字 `0x8000` 的最高位为 1，LH 结果为 `0xFFFF8000`，LHU 为 `0x00008000`。
 
-**期望结果**：两次 Store 均 `missOut=0`，`missValid=0`；后续 Load `0xBFF8` 返回外部输入值而非写入值；普通 CacheLine 完好。
+**关键断言**：LH `rdata == 0xFFFF8000`；LHU `rdata == 0x00008000`。
 
 ---
 
-### T21 — 旁路期间 Cache 内部状态完全不变
+### T11 — 同行不同 word offset：一次 miss 填充整行，各 word 命中
 
-**行为**：回填 way=0 后记录 `evictWay` 基准值；连续执行 10 次 printf SB（写不同字符）和 5 次 mtime LW，再次采样 `evictWay`；最后对普通 CacheLine 全部 16 字逐字读回。
+**场景**：对 tag=11, idx=90 的行触发冷 miss（word=0），DRAM 中该行 word `w` 预设为 `0xF0000000|w`；回填完成后依次 Load word=1/7/15。
 
-**验证目标**：综合验证旁路屏蔽机制的完整性——15 次旁路访问期间 PLRU 树、TagArray、DataArray 均未被修改，`isBypass=1` 时所有写使能的门控逻辑全部有效。
+**验证目标**：FSM 回填时逐字写入全部 16 个字，`refillWord` 从 0 计至 15；之后各 word 均命中并返回正确数据。
 
-**期望结果**：15 次旁路后 `evictWay` 与基准值完全相同；普通 CacheLine 全部 16 字读回值与回填时一致，无任何数据损坏。
+**关键断言**：word=1 `rdata==0xF0000001`；word=7 `rdata==0xF0000007`；word=15 `rdata==0xF000000F`；均 `stall=0`。
+
+---
+
+### T12 — stall 时序：miss 全程 stall=1，命中拍恰好 stall=0
+
+**场景**：对空 Cache 发出 Load，逐拍检查 stall 状态，记录 stall=1 的周期数和 stall=0 时的 rdata；之后立即发出相同地址第二次 Load。
+
+**验证目标**：miss 期间每拍 `stall=1`；命中拍恰好 `stall=0` 且 `rdata` 正确；随后第二次访问也立即命中。
+
+**关键断言**：`stallCnt > 1`；命中拍 `rdata == 0x55AA55AA`；下一拍再访问 `stall=0`。
+
+---
+
+### T13 — PLRU 驱逐顺序：way0→way2→way1→way3 循环，第 5 次 miss 驱逐 way0
+
+**场景**：向 set=110 依次 Load tag=200/300/400/500（填满 4 路）；再 Load tag=600 触发第 5 次 miss。
+
+**验证目标**：PLRU 从初始 `000` 出发，依次填 way0/way2/way1/way3 后 evictWay 回到 0；第 5 次 miss 驱逐 way0（tag=200），驱逐后再次访问 tag=200 应 miss。
+
+**关键断言**：第 5 次 miss `stall=1`；Load tag=600 成功后，Load tag=200 `stall=1`（已被驱逐）。
+
+---
+
+### T14 — Store Miss 回填 dirty=1；驱逐时写回正确数据
+
+**场景**：Store miss 到 set=120（填 way0，dirty=1）；填满 way2/way1/way3；Load 新 tag 触发驱逐 way0（dirty）。
+
+**验证目标**：`refillIsStore=1` 使 TagArray 的 dirty 初值为 1；驱逐时 FSM 进入写回流程，写回 word=0 的数据为 Store 写入的 `0xFACEFACE`。
+
+**关键断言**：监测 WB 请求中 word=0 地址对应 `wdata == 0xFACEFACE`；`wbSeen=true`。
+
+---
+
+### T15 — LB/LBU 在 byte offset 0–3 全部正确提取
+
+**场景**：DRAM 预设 word=`0xAABBCCDD`；填充后对 byte=0/1/2/3 分别执行 LBU 和 LB（有符号）。
+
+**验证目标**：`LoadExtend` 的 `byteShift = Cat(byteoff, 0.U(3.W))` 逻辑对 4 个 byte offset 均正确提取，`0xAA/0xBB/0xCC/0xDD` 均为负字节，LB 均产生符号扩展。
+
+**关键断言**：LBU byte=0/1/2/3 分别返回 `0xDD/0xCC/0xBB/0xAA`；LB 分别返回 `0xFFFFFFDD/0xFFFFFFCC/0xFFFFFFBB/0xFFFFFFAA`。
+
+---
+
+### T16 — LH/LHU 低半字（byte=0）和高半字（byte=2）均正确
+
+**场景**：DRAM 预设 word=`0x80017FFE`；对 byte=0（低半字 `0x7FFE`）和 byte=2（高半字 `0x8001`）分别执行 LH/LHU。
+
+**验证目标**：半字提取的 `halfShift = Cat(byteoff(1), 0.U(4.W))` 逻辑正确；低半字 `0x7FFE` 是正数，LH 不扩展符号；高半字 `0x8001` 是负数，LH 扩展符号。
+
+**关键断言**：LHU byte=0 `rdata==0x7FFE`；LH byte=0 `rdata==0x7FFE`；LHU byte=2 `rdata==0x8001`；LH byte=2 `rdata==0xFFFF8001`。
+
+---
+
+### T17 — 干净行驱逐：全程无 mem.req.wen 请求
+
+**场景**：向 set=55 依次 Load 5 个不同 tag（全 clean），第 5 次触发 clean eviction。
+
+**验证目标**：FSM `sCheck` 拍检测 `dirtyLatch=0`，直接跳转到 `sRefillReq`，跳过 `sWbReq/sWbResp`，全程 `mem.req.wen` 始终为 0。
+
+**关键断言**：整个第 5 次 miss 过程中 `wbSeen` 始终为 false；第 5 个 tag 最终命中且 rdata 正确。
+
+---
+
+### T18 — NOP 和 mtime-bypass Store 不引发 stall 或 mem 请求
+
+**场景 A**：`memRen=0` 且 `wen=0`（idle）；**场景 B**：SW 到 `0xBFF8`（mtime_lo）；**场景 C**：SW 到 `0xBFFC`（mtime_hi）；**场景 D**：miss 完成后再发 NOP。
+
+**验证目标**：NOP 时 `stall=0`、`mem.req.valid=0`、`printChar.valid=0`；mtime Store 被旁路静默忽略，`stall=0`、`mem.req.valid=0`；mtime 读值不受 Store 影响。
+
+**关键断言**：4 种场景均 `stall=0`；SW 后读 `0xBFF8` 仍返回 `mtimeLo` 外部输入值。
+
+---
+
+### T19 — Store miss 仅覆盖目标 word；邻居 word 保留 DRAM 原值
+
+**场景**：DRAM 预设整行 word `w` 为 `0xD0000000|w`；Store miss 到 word=5 写 `0xFEEDFACE`；回填完成后依次 Load word=5/0/10/15。
+
+**验证目标**：write-allocate 先回填整行再执行 hit-store，只有 word=5 被覆盖，其余 word 保留 DRAM 原值；PLRU 和 TagArray 均正确更新。
+
+**关键断言**：word=5 `rdata==0xFEEDFACE`；word=0 `rdata==0xD0000000`；word=10 `rdata==0xD000000A`；word=15 `rdata==0xD000000F`。
+
+---
+
+### T20 — 脏行写回后 DRAMSim storage 中所有 16 个 word 均正确
+
+**场景**：Load tagA2 填充 way0；Store word=0 写 `0xDEADBEEF`、Store word=8 写 `0xBEEFCAFE`（way0 dirty）；填满 way2/way1/way3；Load tagE2 驱逐 way0（dirty）；等待 stall=0 后读 DRAMSim storage。
+
+**验证目标**：比 T05 更深入——直接在内存模型中读回 16 个 word，验证 FSM 写回时 `lineBuf` 内容与 DataArray 一致，Store 修改的 word=0/8 正确，其余 word 保留回填时的值。
+
+**关键断言**：`dram.readWord(tagA2_word0) == 0xDEADBEEF`；`dram.readWord(tagA2_word8) == 0xBEEFCAFE`；其余 word 等于 `(tA2<<8)|w`。
+
+---
+
+### T21 — Flush 清除多个 set；flush 后所有 set 均 miss
+
+**场景**：向 3 个不同 set（idx=10/50/100）各填充 1 条 CacheLine，验证全部命中；发出 flush 1 拍；依次访问 3 个地址。
+
+**验证目标**：`flush` 通过 TagArray 的 `for (s <- 0 until nSets)` 循环清零全部 128 组的 valid/dirty，不只清当前组；3 个不同 set 的 CacheLine 均被清除。
+
+**关键断言**：flush 前 3 个地址均 `stall=0`；flush 后每个地址首拍均 `stall=1`。
